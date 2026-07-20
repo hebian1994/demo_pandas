@@ -1,10 +1,12 @@
 """
-DEMO：按 Worker 列表轮询创建 Actor，让相邻目的地尽量落在不同进程
+DEMO：按 Worker 列表轮询创建 Actor + client.map 计算结果 Future 再追加
 
-- ActorRoundRobin：sorted(workers) + cycle，每次 create 钉到下一个 worker
-- allow_other_workers=False，禁止漂走
-- 打印每个 Actor 实际所在 worker，核对是否轮询散开
-- 多目的地 CSV：算完后 append 到对应 Actor（粘性绑定，作业结束才 finish）
+流程（贴近真实用法）:
+  1. 原始分区 DataFrame 列表
+  2. client.map(process_partition, ...) → 得到 result Futures（不是 DF）
+  3. client.submit(append_to_actor, part_future, writer)
+     → submit 会把 Future 依赖解析成 DF 再调用；数据再送到 Actor 所在 worker 写盘
+  4. Actor 按 worker 轮询创建，相邻目的地尽量不同进程
 
 Windows 下必须 if __name__ == "__main__"。
 """
@@ -17,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from dask.distributed import Client, LocalCluster, wait
+from dask.distributed import Client, Future, LocalCluster, wait
 
 OUTPUT_DIR = Path(__file__).parent / "output" / "multi_dest_actor_rr_demo"
 
@@ -62,7 +64,6 @@ class CsvAppendActor:
         self._f = open(dest, "w", newline="", encoding="utf-8")
 
     def where(self) -> str:
-        """在 Actor 所在进程内取 worker 地址，供核对。"""
         from distributed.worker import get_worker
 
         return get_worker().address
@@ -74,7 +75,7 @@ class CsvAppendActor:
         self._f.flush()
         self.first = False
         self.total += len(pdf)
-        time.sleep(0.10)  # 拖慢写出，便于观察跨 worker 并行
+        time.sleep(0.10)
         print(f"  t=+{t:.3f}s  [{self.name}] rows={len(pdf)} {mode} total={self.total}")
         return self.total
 
@@ -83,24 +84,27 @@ class CsvAppendActor:
         return self.dest, self.total
 
 
-def process_and_append(
-    pdf: pd.DataFrame,
-    writer: CsvAppendActor,
-    tag: str,
-    sleep_s: float,
-) -> int:
+def process_partition(pdf: pd.DataFrame, tag: str, sleep_s: float) -> pd.DataFrame:
+    """分区业务计算：只返回 DataFrame，由 client.map 得到 Future。"""
     time.sleep(sleep_s)
     out = pdf.copy()
     out["amount"] = out["qty"] * out["price"]
     out["dest_tag"] = tag
-    writer.append(out).result()
-    return len(out)
+    return out
+
+
+def append_to_actor(pdf: pd.DataFrame, writer: CsvAppendActor) -> int:
+    """
+    写出包装：入参在运行时已是 DataFrame。
+    调用方应传入「计算完成的 Future」；submit 会先等 Future 完成再注入 pdf。
+    """
+    writer.append(pdf).result()
+    return len(pdf)
 
 
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 4 个目的地、3 个 worker → 轮询后 D 会与 A 同 worker
     n_workers = 3
     dest_names = ["A.csv", "B.csv", "C.csv", "D.csv"]
     dest_paths = {name: OUTPUT_DIR / name for name in dest_names}
@@ -109,16 +113,16 @@ def main() -> None:
             p.unlink()
 
     rng = np.random.default_rng(0)
-    # 每个目的地 2 个分区
-    parts: dict[str, list[pd.DataFrame]] = {}
+    # 原始输入分区（DataFrame）；计算后才会变成 Future
+    input_parts: dict[str, list[pd.DataFrame]] = {}
     sleeps: dict[str, list[float]] = {}
     base = 0
     for di, name in enumerate(dest_names):
-        parts[name] = []
+        input_parts[name] = []
         sleeps[name] = []
         for pi in range(2):
             n = 80
-            parts[name].append(
+            input_parts[name].append(
                 pd.DataFrame(
                     {
                         "order_id": np.arange(base, base + n),
@@ -141,7 +145,6 @@ def main() -> None:
 
     rr = ActorRoundRobin(client)
 
-    # --- 轮询创建 Actor，并核对落点 ---
     writers: dict[str, CsvAppendActor] = {}
     planned_workers: dict[str, str] = {}
     print("\n创建 Actor（轮询）:")
@@ -154,7 +157,6 @@ def main() -> None:
         print(f"  {name}: planned={planned}")
         print(f"         actual ={actual}  [{ok}]")
 
-    # 相邻两次不应相同（最后 D 与 A 同机是预期：4 dest / 3 worker）
     seq = [planned_workers[n] for n in dest_names]
     print("\n落点序列:", seq)
     for i in range(len(seq) - 1):
@@ -165,26 +167,43 @@ def main() -> None:
     if seq[0] == seq[3]:
         print("  A 与 D 同 worker：目的地多于 worker 时的预期回绕")
 
-    # --- 提交计算并写到对应 Actor ---
-    print("\n写出:")
-    futures = []
+    # --- 1) client.map 分区计算 → Futures（不是 DataFrame）---
+    print("\nclient.map 计算分区 → Futures:")
+    part_futures: dict[str, list[Future]] = {}
     for name in dest_names:
-        tag = name[0]  # A/B/C/D
-        for i, pdf in enumerate(parts[name]):
-            futures.append(
+        tag = name[0]
+        n = len(input_parts[name])
+        part_futures[name] = client.map(
+            process_partition,
+            input_parts[name],
+            [tag] * n,
+            sleeps[name],
+            key=[f"part-{tag}-{i}" for i in range(n)],
+        )
+        print(f"  {name}: {[f.key for f in part_futures[name]]}  "
+              f"(type={type(part_futures[name][0]).__name__})")
+
+    # --- 2) 每个计算 Future 再 submit 给对应目的地 Actor ---
+    # submit(append_to_actor, part_fut, writer)：part_fut 是依赖，
+    # 调度器等其完成后把「结果 DF」传给 append_to_actor，再送到 Actor 所在 worker。
+    print("\nsubmit(append_to_actor, part_future, writer):")
+    write_futures: list[Future] = []
+    for name in dest_names:
+        tag = name[0]
+        for i, part_fut in enumerate(part_futures[name]):
+            assert isinstance(part_fut, Future)
+            write_futures.append(
                 client.submit(
-                    process_and_append,
-                    pdf,
+                    append_to_actor,
+                    part_fut,          # ← Future，不是 pdf
                     writers[name],
-                    tag,
-                    sleeps[name][i],
-                    key=f"part-{tag}-{i}",
+                    key=f"write-{tag}-{i}",
                 )
             )
 
     t0 = time.perf_counter()
-    wait(futures)
-    for f in futures:
+    wait(write_futures)
+    for f in write_futures:
         f.result()
 
     results = {name: writers[name].finish().result() for name in dest_names}
