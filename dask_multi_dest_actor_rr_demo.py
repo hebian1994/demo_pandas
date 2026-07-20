@@ -52,7 +52,7 @@ class ActorRoundRobin:
 
 
 class CsvAppendActor:
-    """单目的地写入器：同一 Actor 内串行 append。"""
+    """单目的地写入器：同一 Actor 内串行 append；每次 append 单独 open/close。"""
 
     def __init__(self, dest: str) -> None:
         Path(dest).parent.mkdir(parents=True, exist_ok=True)
@@ -61,7 +61,6 @@ class CsvAppendActor:
         self.first = True
         self.total = 0
         self.t0 = time.perf_counter()
-        self._f = open(dest, "w", newline="", encoding="utf-8")
 
     def where(self) -> str:
         from distributed.worker import get_worker
@@ -71,8 +70,10 @@ class CsvAppendActor:
     def append(self, pdf: pd.DataFrame) -> int:
         t = time.perf_counter() - self.t0
         mode = "新建+header" if self.first else "追加"
-        pdf.to_csv(self._f, index=False, header=self.first)
-        self._f.flush()
+        # 首次 "w" 覆盖创建；之后 "a" 追加。每次调用单独打开/关闭。
+        file_mode = "w" if self.first else "a"
+        with open(self.dest, file_mode, newline="", encoding="utf-8") as f:
+            pdf.to_csv(f, index=False, header=self.first)
         self.first = False
         self.total += len(pdf)
         time.sleep(0.10)
@@ -80,7 +81,6 @@ class CsvAppendActor:
         return self.total
 
     def finish(self) -> tuple[str, int]:
-        self._f.close()
         return self.dest, self.total
 
 
