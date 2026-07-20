@@ -1,0 +1,61 @@
+我生产上面的机器是32核，256GB的MEMORY。
+然后我开的是10个WORKER，threads_per_worker是1，processes没有设置，memory_limit=0，分区是128个分区。
+ResourceProfiler统计出来最大MEM是56GB，MAX(CPU)=max(r.cpu)/n_workers/threads_per_worker得到的是165.46。目前执行时间是16分钟。
+
+chang1---
+加上 OMP/MKL/OPENBLAS/NUMEXPR/VECLIB *_NUM_THREADS=1
+结果: mem≈56GB, 公式CPU≈165, 时间仍≈16min → 基本无变化。
+
+chang2---
+n_workers 10 → 20
+结果: mem 56→70GB, 公式CPU 165→257, 时间 16→15min → 基本无变化。
+
+========== 结论（chang1+chang2 合起来看）==========
+
+1. 瓶颈几乎肯定不在「CPU 核不够 / BLAS 偷线程」
+   - 限 BLAS 线程无效 → 你的 PyArrow+pandas 增删改查本来就不靠这些库并行
+   - worker 翻倍只快 1 分钟 → 计算并行度不是墙钟主因
+   - 继续加到 28 worker，预期也只会小幅波动，别再把希望押在加 worker 上
+
+2. 那个 CPU 公式不要再当「利用率」看
+   - 10w: 165 → 峰值加总约 16.5 核当量
+   - 20w: 257 → 峰值加总约 51 核当量（已超过 32 核，更说明是尖峰/进程数加总失真）
+   - 墙钟几乎不变 + 公式数字变大 = 采样尖峰被更多进程抬高，不代表算得更快
+
+3. mem 56→70GB
+   - worker 更多 → 同时驻留的分区/缓冲更多，峰值内存上涨正常
+   - 也说明数据在集群里堆得住；但没换成更短时间
+
+4. 最可疑：I/O 两遍落盘（你的真实流程）
+   读 CSV → 算 → 每分区写 part CSV（并行）→ 再合并成一份 CSV（串行）
+   合并 + 写 part 若占大头，加 worker 必然几乎不动。
+   数据等于至少写两次；共享盘/机械盘时更明显。
+
+========== 下一步该做的实验（按优先级）==========
+
+exp3--- 分段计时（必须做，否则继续盲调）
+在生产代码里打三戳，跑一轮 10 worker 即可：
+  t1 = 读+to_delayed+compute 完成
+  t2 = client.map(写 part) + gather 完成
+  t3 = 合并成最终 CSV 完成
+看 16min 里谁最大：
+  - t2 或 t3 最大 → I/O/合并瓶颈（与 chang2 吻合）
+  - t1 最大 → 再查分区内 pandas 是否过重、是否多余 copy
+
+exp4--- 合并方式自检
+若合并是 pd.concat([pd.read_csv(p) for p in parts])：
+  改成「二进制拷贝 + 跳过后续 header」（见 demo 的 merge_part_csvs）
+  往往能明显降 t3 和峰值 mem。
+
+exp5--- 验证「不要最终单 CSV」的上限
+临时只写 part-*.csv，跳过合并，看总时间降多少。
+若从 16min → 比如 8min，说明合并/二次写盘吃掉一半，优化方向就定了。
+
+exp6--- 格式（若业务允许）
+最终改 parquet 或保留多文件目录；单 CSV 是串行格式，并行集群最吃亏的交付物。
+
+chang5--- DEMO 对齐真实写法
+1) process 只返回 DataFrame
+2) client.map(custom_to_csv, ...) 写出多个 part CSV
+3) client.map(merge_csv_group, ...) 树形归并（fan_in 份合成 1 份，多轮后剩 1 份）
+注意: map 合并 ≠ 多进程同时写同一个最终文件；总磁盘写入量会增加。

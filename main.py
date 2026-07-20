@@ -1,13 +1,19 @@
 """
 监控 DF 每一列 dtype：非 PyArrow 则转成对应 Arrow 类型。
-可在多层转换之间插入 ensure_pyarrow(df) 做检查点。
+可在多层转换之间插入 ensure_pyarrow(df) 做检查点；
+也可用 @with_pyarrow 装饰业务函数，自动转换输入/输出中的 DF/Series（含容器）。
 """
 
 from __future__ import annotations
 
+from functools import wraps
+from typing import Any, Callable, TypeVar
+
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+
+F = TypeVar("F", bound=Callable[..., Any])
 
 
 def is_pyarrow_backed(dtype) -> bool:
@@ -115,11 +121,84 @@ def _prepare_series_for_arrow(
     return series, arrow_type, f"object({inferred}) -> {target}"
 
 
+def _convert_one_series(
+    series: pd.Series,
+    *,
+    col_label: str = "",
+    prefix: str = "",
+) -> tuple[pd.Series, dict[str, Any]]:
+    """转换单列，返回 (新 series, 报告行)。"""
+    dtype = series.dtype
+    already = is_pyarrow_backed(dtype)
+    name = col_label or (str(series.name) if series.name is not None else "<series>")
+
+    if already:
+        target = dtype if isinstance(dtype, pd.ArrowDtype) else f"(StringDtype storage={dtype.storage})"
+        action = "keep"
+        out = series
+        if isinstance(dtype, pd.StringDtype):
+            try:
+                out = series.astype(pd.ArrowDtype(pa.string()))
+            except Exception as e:
+                raise TypeError(
+                    f"{prefix}列 {name!r} 无法转为 string[pyarrow] ArrowDtype: {e}"
+                ) from e
+            target = out.dtype
+            action = "normalize string[pyarrow] -> string[pyarrow] ArrowDtype"
+        row = {
+            "column": name,
+            "before": str(dtype),
+            "pyarrow?": already,
+            "after": str(out.dtype),
+            "action": action,
+        }
+        return out, row
+
+    arrow_type = numpy_or_pandas_to_arrow(dtype)
+    target = pd.ArrowDtype(arrow_type)
+    action = f"convert -> {target}"
+    try:
+        prepared, arrow_type, action = _prepare_series_for_arrow(
+            series, dtype, target_hint=pd.ArrowDtype(arrow_type)
+        )
+        target = pd.ArrowDtype(arrow_type)
+        out = prepared.astype(target)
+    except Exception as e:
+        raise TypeError(
+            f"{prefix}列 {name!r} 无法转为 PyArrow (before={dtype}): {e}"
+        ) from e
+
+    row = {
+        "column": name,
+        "before": str(dtype),
+        "pyarrow?": already,
+        "after": str(out.dtype),
+        "action": action,
+    }
+    return out, row
+
+
+def ensure_pyarrow_series(
+    series: pd.Series,
+    *,
+    label: str = "",
+    quiet: bool = True,
+) -> pd.Series:
+    """将 Series 转为 PyArrow 后端。"""
+    prefix = f"[{label}] " if label else ""
+    out, row = _convert_one_series(series, prefix=prefix)
+    if not quiet:
+        print(f"\n{prefix}=== Series dtype 检查 ===")
+        print(pd.DataFrame([row]).to_string(index=False))
+    return out
+
+
 def ensure_pyarrow(
     df: pd.DataFrame,
     *,
     label: str = "",
     convert: bool = True,
+    quiet: bool = False,
 ) -> pd.DataFrame:
     """
     检查 DF 每一列是否为 PyArrow 类型；不是则转成对应 Arrow 类型。
@@ -128,60 +207,81 @@ def ensure_pyarrow(
     ----------
     label : 检查点名称，方便在多层转换里定位
     convert : True=转换并返回新 DF；False=只打印报告不改动
+    quiet : True=不打印报告（给装饰器/热路径用）
     """
     prefix = f"[{label}] " if label else ""
-    print(f"\n{prefix}=== dtype 检查 ===")
+    if not quiet:
+        print(f"\n{prefix}=== dtype 检查 ===")
 
-    out = df.copy() if convert else df
+    if not convert:
+        rows = []
+        for col in df.columns:
+            dtype = df[col].dtype
+            already = is_pyarrow_backed(dtype)
+            if already:
+                target = dtype
+                would = "ok"
+            else:
+                target = pd.ArrowDtype(numpy_or_pandas_to_arrow(dtype))
+                would = f"would -> {target}"
+            rows.append(
+                {
+                    "column": col,
+                    "before": str(dtype),
+                    "pyarrow?": already,
+                    "after": "-",
+                    "action": would,
+                }
+            )
+        if not quiet:
+            print(pd.DataFrame(rows).to_string(index=False))
+        return df
+
+    out = df.copy()
     rows = []
-
     for col in df.columns:
-        dtype = df[col].dtype
-        already = is_pyarrow_backed(dtype)
+        converted, row = _convert_one_series(df[col], col_label=str(col), prefix=prefix)
+        out[col] = converted
+        rows.append(row)
 
-        if already:
-            target = dtype if isinstance(dtype, pd.ArrowDtype) else f"(StringDtype storage={dtype.storage})"
-            action = "keep"
-            if convert and isinstance(dtype, pd.StringDtype):
-                # 统一成 ArrowDtype(string)，和其它列风格一致（可选）
-                try:
-                    out[col] = df[col].astype(pd.ArrowDtype(pa.string()))
-                except Exception as e:
-                    raise TypeError(
-                        f"{prefix}列 {col!r} 无法转为 string[pyarrow] ArrowDtype: {e}"
-                    ) from e
-                target = out[col].dtype
-                action = "normalize string[pyarrow] -> string[pyarrow] ArrowDtype"
-        else:
-            arrow_type = numpy_or_pandas_to_arrow(dtype)
-            target = pd.ArrowDtype(arrow_type)
-            action = f"convert -> {target}"
-            if convert:
-                try:
-                    series, arrow_type, action = _prepare_series_for_arrow(
-                        df[col], dtype, target_hint=pd.ArrowDtype(arrow_type)
-                    )
-                    target = pd.ArrowDtype(arrow_type)
-                    out[col] = series.astype(target)
-                except Exception as e:
-                    raise TypeError(
-                        f"{prefix}列 {col!r} 无法转为 PyArrow (before={dtype}): {e}"
-                    ) from e
+    if not quiet:
+        print(pd.DataFrame(rows).to_string(index=False))
+    return out
 
-        rows.append(
-            {
-                "column": col,
-                "before": str(dtype),
-                "pyarrow?": already,
-                "after": str(out[col].dtype) if convert else "-",
-                "action": action if convert else ("ok" if already else f"would -> {target}"),
-            }
-        )
 
-    report = pd.DataFrame(rows)
-    # 报告本身用默认打印即可
-    print(report.to_string(index=False))
-    return out if convert else df
+def convert_pyarrow_tree(obj: Any, *, label: str = "") -> Any:
+    """
+    递归转换输入/输出树：
+    - DataFrame / Series → PyArrow
+    - tuple / list / dict → 逐元素处理，结构不变
+    - 其它类型原样返回
+    """
+    if isinstance(obj, pd.DataFrame):
+        return ensure_pyarrow(obj, label=label, quiet=True)
+    if isinstance(obj, pd.Series):
+        return ensure_pyarrow_series(obj, label=label, quiet=True)
+    if isinstance(obj, tuple):
+        return tuple(convert_pyarrow_tree(x, label=label) for x in obj)
+    if isinstance(obj, list):
+        return [convert_pyarrow_tree(x, label=label) for x in obj]
+    if isinstance(obj, dict):
+        return {k: convert_pyarrow_tree(v, label=label) for k, v in obj.items()}
+    return obj
+
+
+def with_pyarrow(fn: F) -> F:
+    """
+    切面：调用前转换所有参数，调用后转换返回值。
+    支持 DF / Series，以及它们出现在 tuple / list / dict 里的组合。
+    """
+
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        args = tuple(convert_pyarrow_tree(a) for a in args)
+        kwargs = {k: convert_pyarrow_tree(v) for k, v in kwargs.items()}
+        return convert_pyarrow_tree(fn(*args, **kwargs))
+
+    return wrapper  # type: ignore[return-value]
 
 
 def demo() -> None:
@@ -224,6 +324,30 @@ def demo() -> None:
             ensure_pyarrow(bad, label=name)
         except TypeError as e:
             print(f"[{name}] 按预期抛错: {e}")
+
+    # 装饰器：输入/输出都可能是多种形态
+    print("\n=== @with_pyarrow 多类型输入输出 ===")
+
+    @with_pyarrow
+    def process_partition(
+        pdf: pd.DataFrame,
+        extra: pd.Series,
+        meta: dict,
+    ) -> tuple[pd.DataFrame, pd.Series, dict]:
+        out = pdf.copy()
+        out["tag"] = "KKK"  # 易变成 object
+        s = extra.map(lambda x: f"{x}_x")
+        return out, s, {"rows": len(out), **meta}
+
+    raw = pd.DataFrame({"x": [1, 2], "name": ["a", "b"]})
+    extra = pd.Series(["p", "q"], name="extra")
+    out_df, out_s, out_meta = process_partition(raw, extra, {"src": "demo"})
+
+    print("out_df.dtypes:\n", out_df.dtypes, sep="")
+    print("out_s.dtype:", out_s.dtype)
+    print("out_meta:", out_meta)
+    assert is_pyarrow_backed(out_df["tag"].dtype)
+    assert is_pyarrow_backed(out_s.dtype)
 
 
 if __name__ == "__main__":
