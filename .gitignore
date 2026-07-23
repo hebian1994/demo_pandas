@@ -2,3 +2,12 @@ output/
 .venv/
 **/*__pycache__
 *.ipynb
+.dask_scheduler_address
+.dask_queue_stop_scheduler
+.dask_queue_stop_ready
+.dask_queue_stop_pid
+.dask_queue_stop_server.log
+.shared_ds_scheduler
+.shared_ds_ready
+.shared_ds_pid
+.shared_ds_server.log
